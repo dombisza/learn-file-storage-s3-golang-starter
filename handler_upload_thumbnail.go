@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -15,7 +16,7 @@ import (
 	"github.com/google/uuid"
 )
 
-func mimeCheck(mimeType string) error {
+func mimeCheckImage(mimeType string) error {
 	m, _, err := mime.ParseMediaType(mimeType)
 	if err != nil {
 		return err
@@ -76,12 +77,13 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	mediaType := header.Header.Get("Content-Type")
-	if err = mimeCheck(mediaType); err != nil {
+	if err = mimeCheckImage(mediaType); err != nil {
 		respondWithError(w, http.StatusBadRequest, "", err)
 	}
 	ext := mimeToExt(mediaType)
 
 	randKey := make([]byte, 32)
+	rand.Read(randKey)
 	randFileName := base64.RawURLEncoding.EncodeToString(randKey)
 
 	assetPath := fmt.Sprintf("%s.%s", randFileName, ext)
