@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"mime"
 	"net/http"
@@ -20,6 +21,39 @@ import (
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+func processVideoForFastStart(filePath string) (string, error) {
+	workFile := fmt.Sprintf("%s.processing", filePath)
+
+	cmd := exec.Command(
+		"ffmpeg",
+		"-y",
+		"-i", filePath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		"-f", "mp4",
+		workFile,
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		os.Remove(workFile)
+		return "", fmt.Errorf("ffmpeg faststart failed: %w\nstderr: %s", err, stderr.String())
+	}
+
+	stat, err := os.Stat(workFile)
+	if err != nil {
+		return "", fmt.Errorf("ffmpeg produced no output file: %w", err)
+	}
+	if stat.Size() == 0 {
+		os.Remove(workFile)
+		return "", fmt.Errorf("ffmpeg output file is empty (input may be invalid)\nstderr: %s", stderr.String())
+	}
+
+	return workFile, nil
+}
 
 func mimeCheckVideo(mimeType string) error {
 	m, _, err := mime.ParseMediaType(mimeType)
@@ -67,7 +101,7 @@ func getVideoAspectRatio(filePath string) (string, error) {
 
 		ratio := w / h
 
-		const epsilon = 0.02 // adjust as needed; 2% tolerance
+		const epsilon = 0.02
 
 		switch {
 		case math.Abs(ratio-(16.0/9.0)) < epsilon:
@@ -75,8 +109,6 @@ func getVideoAspectRatio(filePath string) (string, error) {
 		case math.Abs(ratio-(9.0/16.0)) < epsilon:
 			result = "9:16"
 		default:
-			// fallback to exact reduced ratio
-			// (your GCD code)
 			a, b := int(w), int(h)
 			for b != 0 {
 				a, b = b, a%b
@@ -124,9 +156,9 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	tempFile, _ := os.CreateTemp("", "tubely-temp-upload.mp4")
 	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
 
 	io.Copy(tempFile, file)
+	log.Println("finished copy", err)
 	tempFile.Seek(0, io.SeekStart)
 	randKey := make([]byte, 32)
 	rand.Read(randKey)
@@ -134,6 +166,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "aspectRatio error", err)
+		return
 	}
 
 	var fileKey string
@@ -145,10 +178,27 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	default:
 		fileKey = fmt.Sprintf("other/%s.%s", randFileName, mimeToExt(mediaType))
 	}
+	///preprocessing
+	tempFile.Sync()
+
+	tempFile.Close()
+	fsVideo, err := processVideoForFastStart(tempFile.Name())
+	log.Println("finished ffmpeg", err)
+
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "", err)
+		return
+	}
+	f, err := os.Open(fsVideo)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "", err)
+		return
+	}
+	defer f.Close()
 	s3Params := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &fileKey,
-		Body:        tempFile,
+		Body:        f,
 		ContentType: &mediaType,
 	}
 	_, err = cfg.s3Client.PutObject(context.Background(), &s3Params)
@@ -162,6 +212,8 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "cannot load video to db", err)
+		return
 	}
 	respondWithJSON(w, http.StatusOK, "")
+	return
 }
