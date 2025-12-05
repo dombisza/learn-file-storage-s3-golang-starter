@@ -15,10 +15,12 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
+	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/database"
 	"github.com/google/uuid"
 )
 
@@ -66,6 +68,35 @@ func mimeCheckVideo(mimeType string) error {
 		return fmt.Errorf("not supported mimetype")
 	}
 	return nil
+}
+
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+	presignClient := s3.NewPresignClient(s3Client)
+	resp, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}, s3.WithPresignExpires(expireTime))
+	if err != nil {
+		return "", err
+	}
+	return resp.URL, nil
+}
+
+func (cfg *apiConfig) dbVideoToSignedVideo(video database.Video) (database.Video, error) {
+	if video.VideoURL == nil {
+		return database.Video{}, fmt.Errorf("video URL is nil")
+	}
+	urlParts := strings.Split(*video.VideoURL, ",")
+	if len(urlParts) != 2 {
+		return database.Video{}, fmt.Errorf("invalid video URL format")
+	}
+	expireTime := 15 * time.Minute
+	presignedURL, err := generatePresignedURL(cfg.s3Client, urlParts[0], urlParts[1], expireTime)
+	if err != nil {
+		return database.Video{}, err
+	}
+	video.VideoURL = &presignedURL
+	return video, nil
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {
@@ -206,7 +237,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "cannot put to s3", err)
 		return
 	}
-	newURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileKey)
+	newURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, fileKey)
 	video.UpdatedAt = time.Now()
 	video.VideoURL = &newURL
 	err = cfg.db.UpdateVideo(video)
@@ -214,6 +245,10 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "cannot load video to db", err)
 		return
 	}
-	respondWithJSON(w, http.StatusOK, "")
-	return
+	presignedVideo, err := cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "cannot presing the video", err)
+	}
+
+	respondWithJSON(w, http.StatusOK, presignedVideo)
 }
